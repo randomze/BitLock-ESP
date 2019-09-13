@@ -83,7 +83,7 @@ void loop() {
     udp.endPacket();
   }
 
-  if (digitalRead(2) == HIGH || deleteMe;) {
+  if (digitalRead(2) == HIGH || deleteMe) {
     EEPROM.begin(256);
     EEPROM.write(0, '\0');
     EEPROM.commit();
