@@ -9,12 +9,18 @@ String id;
 bool deleteMe;
 
 void setup() {
+  Serial.begin(9600);
+  
   id = "";
   deleteMe = false;
   WiFi.mode(WIFI_STA);
   WiFi.begin("BitLockMesh", "bitlockmesh");
 
-  pinMode(2, INPUT);
+  while(WiFi.status() != WL_CONNECTED) {
+    Serial.println(".");
+    delay(1000);
+  }
+
 
   EEPROM.begin(256);
 
@@ -46,7 +52,8 @@ void loop() {
     }
 
     String request = packetBuffer;
-    String reply;
+    Serial.println(request);
+    String reply = "";
     if (request.equals("REG_WAIT?")) {
       if (id.equals("")) {
         reply = "YES";
@@ -55,7 +62,7 @@ void loop() {
       }
     } else if (request.startsWith("REGISTER AS")) {
       if (id.equals("")) {
-        id = request.substring(12);
+        id = request.substring(13);
         EEPROM.begin(256);
         String save = "id=" + id;
         for (int i = 0; i < save.length(); i++) {
@@ -83,7 +90,7 @@ void loop() {
     udp.endPacket();
   }
 
-  if (digitalRead(2) == HIGH || deleteMe) {
+  if (deleteMe) {
     EEPROM.begin(256);
     EEPROM.write(0, '\0');
     EEPROM.commit();

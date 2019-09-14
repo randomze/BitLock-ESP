@@ -99,8 +99,6 @@ void handleSubmit()
 
 void setupSoftAP(void)
 {
-  WiFi.mode(WIFI_AP);
-
   WiFi.softAPConfig(local_IP, gateway, subnet);
   WiFi.softAP("Bit_Lock");
 
@@ -112,19 +110,25 @@ void setupSoftAP(void)
 //CLIENT CODE
 
 void setupClient() {
-  WiFi.mode(WIFI_AP_STA);
   WiFi.begin(ssid, password);
 
-  int result = WiFi.waitForConnectResult();
+  int result;
+  int tries = 1;
+  while((result = WiFi.status()) != WL_CONNECTED && tries < 20) {
+    tries++;
+    delay(500);
+  }
   if (result == WL_CONNECTED) {
     if (serverclient == 0) {
-      WiFi.softAPdisconnect(true);
       serverGateway.send(200, "text/plain", "Sucessfully connected");
       serverGateway.stop();
+      WiFi.softAPdisconnect();
     }
 
     WiFi.softAPConfig(local_IP, gateway, subnet);
     WiFi.softAP("BitLockMesh", "bitlockmesh", 1, 1);
+
+    Serial.println("does this happen");
 
     serverClient = new ESP8266WebServer(WiFi.localIP(), 80);
     if (EEPROMaddress == 0) {
@@ -159,7 +163,8 @@ void setupClient() {
     broadcastAddress = (uint32_t)WiFi.softAPIP() | ~subnet;
 
     serverClient->on("/", handleClientRoot);
-    serverClient->on("/devices", handleClientRegisterDevice);
+    serverClient->on("/devices/", handleClientRegisterDevice);
+    serverClient->on("/reset", handleReset);
 
     serverClient->begin();
 
@@ -168,6 +173,7 @@ void setupClient() {
     serverclient = 1;
   } else {
     serverGateway.send(500, "text/plain", "Failed to connect");
+    serverclient = 0;
   }
 }
 
@@ -176,7 +182,7 @@ void handleClientRoot() {
     if (serverClient->method() == HTTP_GET && master_unique != "") {
       serverClient->send(200, "text/plain", master_unique);
     } else {
-      serverClient->send(404, "text/plain", "ITS A ME, BITLOCK!");
+      serverClient->send(200, "text/plain", "ITS A ME, BITLOCK!");
     }
   }
   else if (master_unique = "")
@@ -201,7 +207,7 @@ void handleClientRoot() {
 
     serverClient->send(200, "text/plain", "OK!");
   } else {
-    serverClient->send(400, "text/plain", "Already registered, please stop");
+    serverClient->send(200, "text/plain", "Already registered, please stop");
   }
 }
 
@@ -212,6 +218,7 @@ void handleClientRegisterDevice() {
   if (serverClient->method() == HTTP_GET) {
     while (!sendPacket((uint8_t *)strcat(message, "REG_WAIT?"), strlen(message) + 1)) Serial.println("trying to send packet");
 
+    delay(1000);
     int packetSize = udp.parsePacket();
     if (packetSize) {
       int len = udp.read(response, 255);
@@ -220,12 +227,14 @@ void handleClientRegisterDevice() {
       }
     }
 
+    Serial.println(response);
+
     if (strcmp(response, "NO") == 0) {
       serverClient->send(200, "text/plain", "No device to register");
     } else if (strcmp(response, "YES") == 0) {
       serverClient->send(200, "text/plain", "Device waiting to be registered");
     } else {
-      serverClient->send(500, "text/plain", "Unable to get a proper response");
+      serverClient->send(200, "text/plain", "Unable to get a proper response");
     }
 
   } else if (serverClient->method() == HTTP_POST) {
@@ -243,7 +252,7 @@ void handleClientRegisterDevice() {
     if (strcmp(response, "DONE") == 0) {
       serverClient->send(200, "text/plain", "DONE");
     } else {
-      serverClient->send(500, "text/plain", "Unable to register");
+      serverClient->send(200, "text/plain", "Unable to register");
     }
   } else if(serverClient->method() == HTTP_DELETE) {
     String device_id = serverClient->arg("plain");
@@ -258,14 +267,16 @@ void checkForMessage() {
   const char* host = "https://bitlock-api.herokuapp.com/devices/waiting/";
 
   String thumbprint = "08:3B:71:72:02:43:6E:CA:ED:42:86:93:BA:7E:DF:81:C4:BC:62:30";
-
+  
   if (client.begin(String(host) + master_unique, thumbprint)) {
     int statusCode = client.GET();
     String response;
     if (statusCode > 0) {
       response = client.getString();
     }
-    while (!sendPacket((uint8_t *)response.c_str(), response.length() + 1)) Serial.println("trying to send packet");
+    if(response.startsWith("OPEN")) {
+      while (!sendPacket((uint8_t *)response.c_str(), response.length() + 1)) Serial.println("trying to send packet");  
+    }
   }
 }
 
@@ -277,16 +288,16 @@ bool sendPacket(const uint8_t* buf, uint8_t bufSize) {
 
 void setup(void)
 {
-  EEPROM.begin(256);
-  pinMode(2, INPUT);
-
   Serial.begin(9600);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoConnect(false);
   char buffer[65];
 
   master_unique = "";
   int i;
   EEPROMaddress = 0;
+
+  EEPROM.begin(256);
 
   for (i = 0; i < 3; i++) {
     buffer[i] = EEPROM.read(i);
@@ -320,11 +331,21 @@ void setup(void)
 
     serverclient = 1;
     setupClient();
+    if(serverclient == 0) {
+      setupSoftAP();
+    }
   } else {
     serverclient = 0;
     setupSoftAP();
   }
 
+}
+
+void handleReset() {
+  EEPROM.begin(256);
+  EEPROM.write(0, '\0');
+  EEPROM.commit();
+  ESP.restart();
 }
 
 void loop(void)
@@ -348,12 +369,5 @@ void loop(void)
     checkForMessage();
   } else {
     serverGateway.handleClient();
-  }
-
-  if(digitalRead(2) == HIGH) {
-    EEPROM.begin(256);
-    EEPROM.write(0, '\0');
-    EEPROM.commit();
-    ESP.restart();
   }
 }
