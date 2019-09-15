@@ -101,11 +101,11 @@ void readIDFromEEPROM() {
 
   EEPROM.begin(256);
   for(int i = 0; i < 3; i++) {
-    temp += EEPROM.read(i);
+    temp += (char)EEPROM.read(i);
     delay(200);
   }
 
-  if(temp.startsWith("id=")) {
+  if(temp.startsWith("id+")) {
     char c;
     for(int i = 3; (c = EEPROM.read(i)) != '\0'; i++) {
       id += c;
