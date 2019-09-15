@@ -185,6 +185,7 @@ void handleMasterRoot() {
 
 void handleMasterDevices() {
 	char message[100];
+	message[0] = 0;
 	
 	if(master->method() == HTTP_GET) {
 		strcat(message, "REG_WAIT?");
@@ -213,7 +214,7 @@ void handleMasterDevices() {
 		if(response.length() == 0) {
 			master->send(200, "text/plain", "No devices reachable");
 		} else if(response.equals("DONE")) {
-			master->send(200, "text/plain", "Device registered");
+			master->send(200, "text/plain", "DONE");
 		} else {
 			master->send(200, "text/plain", "Unable to understand response. Please try again");
 		}		
