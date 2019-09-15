@@ -1,477 +1,312 @@
-#include <map>
-#include <queue>
+#include <memory>
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
 #include <EEPROM.h>
 
-#define IP(a,b,c,d) (uint32_t)(a | (b << 8) | (c << 16) | (d << 24))
+#include "http_page.h"
 
-const uint32_t local_IP = IP(192, 168, 20, 1);
-const uint32_t gateway = local_IP;
-const uint32_t subnet = IP(255, 255, 255, 0);
+//enum definition to keep track of program state
+enum State {UNDEFINED, GATEWAY, MASTER};
 
-const uint16_t masterPort = 2004;
-const uint16_t UDPSlavePort = 2016;
-const uint16_t TCPSlavePort = 2019;
+//Global variables to keep track of program state
+State state = UNDEFINED;
+bool gatewaySetUp;
+bool masterSetUp;
+bool discovered;
 
-bool waitingForRegister;
+//Pointers to the server objects. Must be initialized at a later time
+std::unique_ptr<ESP8266WebServer> gateway, master;
 
-ESP8266WebServer serverGateway(80);
-ESP8266WebServer *serverMaster;
-WiFiUDP udp;
 HTTPClient client;
 
-String master_unique;
-String ssid;
-String password;
-
+//Define configuration variables necessary to initialize the Access Point mode
+IPAddress local_IP = IPAddress(192,168,20,1);
+IPAddress gateway_IP = IPAddress(192,168,20,1);
+IPAddress subnet = IPAddress(255,255,255,0);
 IPAddress broadcastAddress;
 
-int gatewayOrMaster;
+//UDP ports
+#define MASTER_PORT 2004
+#define SLAVE_PORT 2016
 
-int EEPROMaddress;
+//Variable that holds id
+String id;
 
-std::map<String, WiFiClient> slaveMap;
+WiFiUDP udp;
 
-//SERVER CODE
+void setup() {
+	Serial.begin(9600);
+	WiFi.mode(WIFI_AP_STA);
+	gatewaySetUp = false;
+	masterSetUp = false;
+	discovered = false;
 
-const char INDEX_HTML_PRELIST[] =
-  "<!DOCTYPE HTML>"
-  "<html>"
-  "<head>"
-  "<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\">"
-  "<title>Bit Lock</title>"
-  "<style>"
-  "\"body { background-color: #808080; font-family: Arial, Helvetica, Sans-Serif; Color: #000000; }\""
-  "</style>"
-  "</head>"
-  "<body>"
-  "<h1>Bit Lock</h1>"
-  "<FORM action=\"/\" method=\"post\">"
-  "<P>"
-  "<SELECT name=\"network\">";
+	readIDFromEEPROM();
 
-const char INDEX_HTML_POSTLIST[] =
-  "</select> <br>"
-  "<INPUT type=\"text\" name=\"password\">"
-  "<br>"
-  "<INPUT type=\"submit\" value=\"Connect\">"
-  "</P>"
-  "</FORM>"
-  "</body>"
-  "</html>";
+	for(int i = 0; i < 10; i++) {
+		Serial.print("-");
+		delay(500);
+	}
 
-// GPIO#0 is for Adafruit ESP8266 HUZZAH board. Your board LED might be on 13.
-
-void handleServerRoot()
-{
-  if (serverGateway.hasArg("password")) {
-    handleSubmit();
-  }
-  else {
-    int numNetworks = WiFi.scanNetworks();
-
-    String INDEX_HTML = INDEX_HTML_PRELIST;
-    for (int i = 0; i < numNetworks; i++)
-    {
-      INDEX_HTML += "<option value=\"";
-      INDEX_HTML += WiFi.SSID(i);
-      INDEX_HTML += "\">";
-      INDEX_HTML += WiFi.SSID(i);
-      INDEX_HTML += "</option>\n";
-    }
-    INDEX_HTML += INDEX_HTML_POSTLIST;
-
-    serverGateway.send(200, "text/html", INDEX_HTML);
-  }
+	Serial.println();
 }
 
-void handleSubmit()
-{
-  if (!serverGateway.hasArg("network") || !serverGateway.hasArg("password")) {
-    serverGateway.send(404, "text/plain", "Missing arguments: network or password");
-  } else {
-    ssid = serverGateway.arg("network");
-    password = serverGateway.arg("password");
+void loop() {
 
-    setupMaster();
-  }
-}
+	delay(1000);
 
-//CLIENT CODE
+	if(state == UNDEFINED) {
+		if(WiFi.status() == WL_CONNECTED) {
+			state = MASTER;
+		} else {
+			state = GATEWAY;
+		}
+	} else if(state == GATEWAY) {
+		if(!gatewaySetUp) {
+			setUpGateway();
+		}
 
-void checkForMessage() {
-  const char* host = "https://bitlock-api.herokuapp.com/devices/waiting/";
+		gateway->handleClient();
 
-  String thumbprint = "08:3B:71:72:02:43:6E:CA:ED:42:86:93:BA:7E:DF:81:C4:BC:62:30";
+		if(WiFi.status() == WL_CONNECTED) {
+			cleanupGateway();
+			state = MASTER;
+			delay(500);
+		}
+	} else {
+		if(!masterSetUp) {
+			setUpMaster();
+		}
 
-  if (client.begin(String(host) + master_unique, thumbprint)) {
-    int statusCode = client.GET();
-    String response;
-    if (statusCode > 0) {
-      response = client.getString();
-    }
-    if (response.startsWith("OPEN")) {
-      String slaveId = response.substring(6);
-      slaveId.trim();
-      if(slaveMap.find(slaveId) != slaveMap.end()) {
-        WiFiClient client  = slaveMap[slaveId];
-        if(client.connected()) {
-          Serial.println("Connected to " + slaveId);
-          client.print("OPEN\n");
-          client.flush();
-        } else {
-          Serial.println("Couldnt connect to " + slaveId);
-        }
-      }
-    }
-  }
-}
+		if(!discovered) {
+			receivePacket();
+		}
 
-void setup(void)
-{
-  Serial.begin(9600);
-  WiFi.setAutoConnect(false);
-  WiFi.mode(WIFI_AP_STA);
-  char buffer[65];
+		master->handleClient();
+		checkForMessage();
+	}
 
-  master_unique = "";
-  int i;
-  EEPROMaddress = 0;
-  waitingForRegister = 0;
-
-  EEPROM.begin(256);
-
-  for (i = 0; i < 3; i++) {
-    buffer[i] = EEPROM.read(i);
-  }
-
-  if (buffer[0] == 'w' && buffer[1] == 'l' && buffer[2] == '=') {
-
-    EEPROMaddress += i;
-    for (i = 0; (buffer[i] = EEPROM.read(EEPROMaddress + i)) != '\0'; i++) {
-      ssid += buffer[i];
-    }
-
-    EEPROMaddress += i + 1;
-    for (i = 0; (buffer[i] = EEPROM.read(EEPROMaddress + i)) != '\0'; i++) {
-      password += buffer[i];
-    }
-
-    EEPROMaddress += i + 1;
-    for (i = 0; i < 3; i++) {
-      buffer[i] = EEPROM.read(EEPROMaddress + i);
-    }
-
-    if (buffer[0] == 'i' && buffer[1] == 'd' && buffer[2] == '=') {
-
-      EEPROMaddress += i;
-      for (i = 0; (buffer[i] = EEPROM.read(EEPROMaddress + i)) != '\0'; i++) {
-        master_unique += buffer[i];
-      }
-      EEPROMaddress += i + 1;
-    }
-
-    gatewayOrMaster = 1;
-    setupMaster();
-    if (gatewayOrMaster == 0) {
-      setupConnectGateway();
-    }
-  } else {
-    gatewayOrMaster = 0;
-    setupConnectGateway();
-  }
+	Serial.println("my id is " + id);
 
 }
 
-void handleReset() {
-  EEPROM.begin(256);
-  EEPROM.write(0, '\0');
-  EEPROM.commit();
-  ESP.restart();
+//Sets everything up for the board to serve as a gateway to allow the user to connect it to a network
+void setUpGateway() {
+	WiFi.softAP("BitLock");
+	WiFi.softAPConfig(local_IP, gateway_IP, subnet);
+
+	gateway = std::unique_ptr<ESP8266WebServer>(new ESP8266WebServer(80));
+
+	gateway->on("/", gatewayHandleRoot);
+	gateway->on("/connect", gatewayHandleConnect);
+	gateway->begin();
+
+	gatewaySetUp = true;
 }
 
-void loop(void)
-{
-  if (gatewayOrMaster == 1) {
-    delay(500);
-    findSlavesOnNetwork();
-    serverMaster->handleClient();
-    receivePacket();
-    checkForMessage();
-  } else {
-    serverGateway.handleClient();
-  }
+//Serves the webpage for the root page on the gateway webserver
+void gatewayHandleRoot() {
+	int nNetworks = WiFi.scanNetworks();
+
+	String response = INDEX_HTML_PRELIST;
+
+	for(int i = 0; i < nNetworks; i++) {
+		response += "<option value=\"";
+		response += WiFi.SSID(i);
+		response += "\">";
+		response += WiFi.SSID(i);
+		response += "</option>\n";
+	}
+
+	response += INDEX_HTML_POSTLIST;
+
+	gateway->send(200, "text/html", response);
 }
 
-
-void findSlavesOnNetwork()
-{
-  char message[] = "Anyone there?";
-  sendPacket((uint8_t *) message, strlen(message) + 1);
-
-  int i = 0;
-  while(!udp.parsePacket()) {
-    i++;
-    delay(400);
-    if(i > 5)
-      break;
-  }
-
-  String packet = receivePacket();
-
-  Serial.println(packet);
-
-  if(packet.equals("Yes")) {
-    Serial.println("FOUND SLAVE");
-    WiFiClient client;
-    if(client.connect(udp.remoteIP(), TCPSlavePort)) {
-      client.print("REG_WAIT?\n");
-      client.flush();
-      Serial.println("SUCESSFULLY CONNECTED TO SLAVE OVER TCP");
-      if(client.available()) {
-        String response = client.readStringUntil('\n');
-        Serial.println("response: " + response);
-        if(response.equals("YES")) {
-          Serial.println("response==YES");
-          slaveMap[""] = client;
-          waitingForRegister = true;
-        } else {
-          Serial.println("response!=YES");
-          slaveMap[response] = client;
-        }
-      }
-    } else {
-      Serial.println("tcp failed");
-    }
-  }
+//Handles the form data to connect to the wifi networks
+void gatewayHandleConnect() {
+	if(!gateway->hasArg("network") || !gateway->hasArg("password")) {
+		gateway->sendHeader("Location", "/", true);
+		gateway->send(302, "text/html", "");
+	} else {
+		WiFi.begin(gateway->arg("network"), gateway->arg("password"));
+		gateway->send(200);
+	}
 }
 
-//
-//
-//   UDP helper functions
-//
-//
+void cleanupGateway() {
+	gateway->stop();
 
-bool sendPacket(const uint8_t* buf, uint8_t bufSize) {
-  udp.beginPacket(broadcastAddress, TCPSlavePort);
-  udp.write(buf, bufSize);
-  return (udp.endPacket() == 1);
+	WiFi.softAPdisconnect();
+}
+
+void setUpMaster() {
+	WiFi.softAP("BitLockMesh", "bitlockmesh", 1, 1);
+
+	delay(1000);
+
+	master = std::unique_ptr<ESP8266WebServer>(new ESP8266WebServer(WiFi.localIP(), 80));
+
+	master->on("/", handleMasterRoot);
+	master->on("/devices/", handleMasterDevices);
+	master->on("/reset/", handleMasterReset);
+	master->begin();
+
+	broadcastAddress = (uint32_t)WiFi.softAPIP() | ~((uint32_t)subnet);
+	udp.begin(MASTER_PORT);
+
+	masterSetUp = true;
+}
+
+void handleMasterRoot() {
+
+	if(master->method() == HTTP_GET) {
+		if(id.length() == 0) {
+			master->send(200, "text/plain", "ITS A ME, BITLOCK!");
+		} else {
+			master->send(200, "text/plain", id);
+		}
+	} else if(master->method() == HTTP_POST) {
+		if(id.length() == 0) {
+			id = master->arg("plain");
+			writeIDToEEPROM();
+			master->send(200, "text/plain", "Registered");
+		} else {
+			master->send(403, "text/plain", "Already registered");
+		}
+
+	} else {
+		master->send(405, "text/plain", "Method not allowed");
+	}
+}
+
+void handleMasterDevices() {
+	char message[100];
+	
+	if(master->method() == HTTP_GET) {
+		strcat(message, "REG_WAIT?");
+		broadcastPacketToSlaves((uint8_t *) message, strlen(message) + 1);
+
+		String response = receivePacket();
+
+		if(response.length() == 0) {
+			master->send(200, "text/plain", "No devices reachable");
+		} else if(response.equals("NO")) {
+			master->send(200, "text/plain", "No devices waiting for register");
+		} else if(response.equals("YES")) {
+			master->send(200, "text/plain", "Device waiting to be registered");
+		} else {
+			master->send(200, "text/plain", "Unable to understand response. Please try again");
+		}	
+	} else if(master->method() == HTTP_POST) {
+		strcat(message, "REGISTER AS ");
+		String slaveId = master->arg("plain");
+		strcat(message, slaveId.c_str());
+
+		broadcastPacketToSlaves((uint8_t *)message, strlen(message) + 1);
+
+		String response = receivePacket();
+
+		if(response.length() == 0) {
+			master->send(200, "text/plain", "No devices reachable");
+		} else if(response.equals("DONE")) {
+			master->send(200, "text/plain", "Device registered");
+		} else {
+			master->send(200, "text/plain", "Unable to understand response. Please try again");
+		}		
+	} else {
+		master->send(405, "text/plain", "Method not allowed");
+	}
+}
+
+void handleMasterReset() {
+	EEPROM.begin(256);
+	EEPROM.write(0, '\0');
+	EEPROM.commit();
+}
+
+void broadcastPacketToSlaves(uint8_t* buf, uint8_t length) {
+	udp.beginPacket(broadcastAddress, SLAVE_PORT);
+	udp.write(buf, length);
+	udp.endPacket();
 }
 
 String receivePacket() {
-  char buffer[255];
-  buffer[0] = 0;
+	char buffer[200];
+	int packetSize;
+	while((packetSize = udp.parsePacket()) == 0) delay(50);
 
-  int packetSize = udp.parsePacket();
-  if (packetSize) {
-    int len = udp.read(buffer, 255);
-    if (len > 0) {
-      buffer[len] = 0;
-    }
-  }
+	int length = udp.read(buffer, 200);
+	if(length > 0) {
+		buffer[length] = 0;
+	}
 
-  if (strcmp(buffer, "Finding Bitlock") == 0) {
-    udp.beginPacket(udp.remoteIP(), udp.remotePort());
-    udp.write("You found me, lying on the floor");
-    udp.endPacket();
-    return "";
-  } else {
-    return String(buffer);
-  }
+	if(strcmp(buffer, "Finding Bitlock") == 0) {
+		udp.beginPacket(udp.remoteIP(), udp.remotePort());
+    	udp.write("You found me, lying on the floor");
+    	udp.endPacket();
+    	discovered = true;
+    	return "";
+	} else {
+		return String(buffer);
+	}
 }
 
-//
-//
-//   serverMaster page handling functions
-//
-//
+void writeIDToEEPROM() {
+	EEPROM.begin(256);
 
-void handleClientRoot() {
-  if (serverMaster->method() != HTTP_POST) {
-    if (serverMaster->method() == HTTP_GET && master_unique != "") {
-      serverMaster->send(200, "text/plain", master_unique);
-    } else {
-      serverMaster->send(200, "text/plain", "ITS A ME, BITLOCK!");
-    }
-  }
-  else if (master_unique = "")
-  {
-    master_unique = serverMaster->arg("plain");
+	String temp = "id+" + id;
+	for(unsigned int i = 0; i < temp.length(); i++) {
+	EEPROM.write(i, temp[i]);
+	delay(100);
+	}
 
-    EEPROM.begin(256);
+	EEPROM.write(temp.length(), '\0');
+	delay(100);
 
-    unsigned int i = 0;
-    master_unique = String("id=") + master_unique;
-    for (; i < master_unique.length(); i++) {
-      EEPROM.write(EEPROMaddress + i, master_unique[i]);
-      delay(200);
-    }
-
-    EEPROM.write(EEPROMaddress + i, '\0');
-    delay(200);
-
-    EEPROM.commit();
-
-    master_unique = master_unique.substring(4);
-
-    serverMaster->send(200, "text/plain", "OK!");
-  } else {
-    serverMaster->send(200, "text/plain", "Already registered, please stop");
-  }
+	EEPROM.commit();
 }
 
-void handleClientRegisterDevice() {
-  if (serverMaster->method() == HTTP_GET) {
-    serverMaster->send(200, "text/plain", waitingForRegister ? "Device waiting to be registered" : "No devices available for registering");
+void readIDFromEEPROM() {
+	String temp;
 
-  } else if (serverMaster->method() == HTTP_POST) {
-    String device_id = serverMaster->arg("plain");
+	EEPROM.begin(256);
+	for(int i = 0; i < 3; i++) {
+		temp += EEPROM.read(i);
+		delay(200);
+	}
 
-    if (waitingForRegister) {
-      WiFiClient client = slaveMap[""];
-      if(client.connected()) {
-        Serial.println("Connected to slave to be registered");
-        client.print("REGISTER AS ");
-        client.print(device_id);
-        client.print("\n");
-        client.flush();
-
-        if(client.available()) {
-          String response = client.readStringUntil('\n');
-          Serial.println("response: " + response);
-          if(response.equals("DONE")) {
-            Serial.println("response==DONE");
-            slaveMap[device_id] = client;
-            slaveMap.erase("");
-            waitingForRegister = false;
-            serverMaster->send(200, "text/plain", "Device sucessfully registered");
-          } else {
-            Serial.println("response!=DONE");
-            serverMaster->send(200, "text/plain", "Unable to register device");
-          }
-        }
-      } else {
-        Serial.println("Fail to connect to slave to be registered");
-      }
-
-    } else {
-      Serial.println("No devices available");
-      serverMaster->send(200, "text/plain", "No devices available for registering");
-    }
-  } else if (serverMaster->method() == HTTP_DELETE) {
-    String device_id = serverMaster->arg("plain");
-
-    if(slaveMap.find(device_id) != slaveMap.end()) {
-      WiFiClient client = slaveMap[device_id];
-      if(client.connected()) {
-        client.print("DELETE\n");
-        client.flush();
-        client.stop();
-
-        slaveMap.erase(device_id);
-      }
-    } else {
-      serverMaster->send(200, "text/plain", "No such device");
-    }
-  } else {
-    serverMaster->send(405, "text/plain", "Method not allowed");
-  }
+	if(temp.startsWith("id=")) {
+		char c;
+		for(int i = 3; (c = EEPROM.read(i)) != '\0'; i++) {
+			id += c;
+			delay(200);
+		}
+	} else {
+		id = "";
+	}
 }
 
-//
-//
-//   Setup functions for the different running modes
-//
-//
+void checkForMessage() {
+	const char* host = "https://bitlock-api.herokuapp.com/devices/waiting/";
 
-void setupMaster() {
-  Serial.println("1");
-  WiFi.begin(ssid, password);
+	String thumbprint = "08:3B:71:72:02:43:6E:CA:ED:42:86:93:BA:7E:DF:81:C4:BC:62:30";
 
-  Serial.println("2");
-  int result;
-  Serial.println("3");
-  int tries = 1;
-  Serial.println("4");
-  while ((result = WiFi.status()) != WL_CONNECTED && tries < 20) {
-    Serial.println("5");
-    tries++;
-    Serial.println("6");
-    delay(500);
-    Serial.println("7");
-  }
-  Serial.println("8");
-  if (result == WL_CONNECTED) {
-    Serial.println("9");
-    Serial.println("connected sucessfully to wifi");
-    if (gatewayOrMaster == 0) {
-      serverGateway.send(200, "text/plain", "Sucessfully connected");
-      serverGateway.stop();
-      WiFi.softAPdisconnect();
-    }
-
-    WiFi.softAPConfig(local_IP, gateway, subnet);
-    WiFi.softAP("BitLockMesh", "bitlockmesh", 1, 1);
-
-    Serial.println("does this happen");
-
-    serverMaster = new ESP8266WebServer(WiFi.localIP(), 80);
-    if (EEPROMaddress == 0) {
-      unsigned int i;
-      String temp = "wl=";
-      EEPROM.begin(256);
-      for (i = 0; i < 3; i++) {
-        EEPROM.write(EEPROMaddress + i, temp[i]);
-        delay(200);
-      }
-      EEPROMaddress += i;
-
-      for (i = 0; i < ssid.length(); i++) {
-        EEPROM.write(EEPROMaddress + i, ssid[i]);
-        delay(200);
-      }
-      EEPROM.write(EEPROMaddress + i, '\0');
-
-      EEPROMaddress += i + 1;
-      for (i = 0; i < password.length(); i++) {
-        EEPROM.write(EEPROMaddress + i, password[i]);
-        delay(200);
-      }
-      EEPROM.write(EEPROMaddress + i, '\0');
-      delay(200);
-
-      EEPROM.commit();
-
-      EEPROMaddress += i + 1;
-    }
-
-    broadcastAddress = (uint32_t)WiFi.softAPIP() | ~subnet;
-
-    serverMaster->on("/", handleClientRoot);
-    serverMaster->on("/devices/", handleClientRegisterDevice);
-    serverMaster->on("/reset/", handleReset);
-
-    serverMaster->begin();
-
-    //NEVER FORGET, EURO 2004
-    udp.begin(2004);
-    gatewayOrMaster = 1;
-  } else {
-    serverGateway.send(500, "text/plain", "Failed to connect");
-    gatewayOrMaster = 0;
-  }
-}
-
-void setupConnectGateway(void)
-{
-  WiFi.softAPConfig(local_IP, gateway, subnet);
-  WiFi.softAP("Bit_Lock");
-
-  serverGateway.on("/", handleServerRoot);
-
-  serverGateway.begin();
+	if (id.length() > 0 && client.begin(String(host) + id, thumbprint)) {
+		int statusCode = client.GET();
+		String response;
+		if (statusCode > 0) {
+			response = client.getString();
+		}
+		Serial.println(response);
+		if (response.startsWith("OPEN")) {
+			char message[100];
+			response.toCharArray(message, 100);
+			Serial.println(message);
+			broadcastPacketToSlaves((uint8_t *)message, strlen(message) + 1);
+		}
+	}
 }
